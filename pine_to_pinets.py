@@ -38,6 +38,7 @@ class Add: pass
 class Sub: pass
 class Mult: pass
 class Div: pass
+class Mod: pass
 class Gt: pass
 class Lt: pass
 class Eq: pass
@@ -46,6 +47,42 @@ class Or: pass
 class And: pass
 class Store: pass
 class Load: pass
+
+class FunctionDef(Node):
+    def __init__(self, name, args, body, method=None, export=None, annotations=[]):
+        self.name = name
+        self.args = args
+        self.body = body
+        self.method = method
+        self.export = export
+        self.annotations = annotations
+
+class While(Node):
+    def __init__(self, test, body=None):
+        self.test = test
+        self.body = body
+
+class If(Node):
+    def __init__(self, test, body, orelse):
+        self.test = test
+        self.body = body
+        self.orelse = orelse
+
+class ForTo(Node):
+    def __init__(self, target, start, end, body):
+        self.target = target
+        self.start = start
+        self.end = end
+        self.body = body
+
+class Param(Node):
+    def __init__(self, name):
+        self.name = name
+
+class UnaryOp(Node):
+    def __init__(self, op, operand):
+        self.op = op # UAdd(), USub() etc.
+        self.operand = operand
 
 class Call(Node):
     def __init__(self, func, args):
@@ -109,6 +146,7 @@ class PyneToJsAstConverter:
         elif isinstance(op_node, Sub): return '-'
         elif isinstance(op_node, Mult): return '*'
         elif isinstance(op_node, Div): return '/'
+        elif isinstance(op_node, Mod): return '%'
         # Add mappings for other operators as needed
         raise NotImplementedError(f"Operator mapping not implemented for {type(op_node)}")
 
@@ -201,10 +239,10 @@ class PyneToJsAstConverter:
 
     def visit_Call(self, node):
         callee = self.visit(node.func)
-        
+
         # Check if this is a call to the 'input' function identifier
         is_input_call = isinstance(node.func, Name) and node.func.id == 'input'
-        
+
         positional_args_js = []
         named_args_props = []
 
@@ -229,7 +267,7 @@ class PyneToJsAstConverter:
                     # Check the type of the *value* of the first positional Constant argument
                     first_arg_py_value = arg.value.value
                     input_type_attr = None
-                    
+
                     # Order matters: check float before int if Python auto-converts int to float visually (e.g. 2.0)
                     # However, Python AST Constant should preserve the original type
                     if isinstance(first_arg_py_value, bool):
@@ -243,7 +281,7 @@ class PyneToJsAstConverter:
                     #     input_type_attr = 'string'
 
                     if input_type_attr:
-                        # Modify the callee from Identifier('input') 
+                        # Modify the callee from Identifier('input')
                         # to MemberExpression('input', 'type')
                         callee = estree_node('MemberExpression',
                                              object=estree_node('Identifier', name='input'), # Recreate base 'input' identifier
@@ -258,7 +296,7 @@ class PyneToJsAstConverter:
         if named_args_props:
             options_object = estree_node('ObjectExpression', properties=named_args_props)
             final_args_js.append(options_object)
-            
+
         # Use the potentially modified callee
         return estree_node('CallExpression', callee=callee, arguments=final_args_js)
 
@@ -273,6 +311,11 @@ class PyneToJsAstConverter:
         # An Expr node in Python AST usually represents an expression used as a statement
         # (e.g., a function call that doesn't assign to anything).
         # In ESTree, this corresponds to an ExpressionStatement.
+
+        # Special cases for control flow nodes - return them directly without wrapping
+        if isinstance(node.value, (While, If, ForTo)):
+            return self.visit(node.value)
+
         return estree_node('ExpressionStatement', expression=self.visit(node.value))
 
     def visit_Conditional(self, node):
@@ -321,11 +364,174 @@ class PyneToJsAstConverter:
                            property=prop,
                            computed=True) # Use bracket notation
 
+    def visit_FunctionDef(self, node):
+        # Convert function name to identifier
+        func_name = node.name
 
+        # Convert parameters
+        params = [self.visit(arg) for arg in node.args]
+
+        # Convert body statements
+        body_statements = [self.visit(stmt) for stmt in node.body]
+
+        # Create function body block
+        body_block = estree_node('BlockStatement', body=body_statements)
+
+        # Check if the last statement is an expression that could be returned
+        if body_statements and isinstance(node.body[-1], Expr):
+            # Replace the last expression statement with a return statement
+            return_stmt = estree_node('ReturnStatement',
+                                    argument=self.visit(node.body[-1].value))
+            body_block['body'] = body_statements[:-1] + [return_stmt]
+
+        # Create the function declaration
+        func_declaration = estree_node(
+            'VariableDeclaration',
+            declarations=[
+                estree_node(
+                    'VariableDeclarator',
+                    id=estree_node('Identifier', name=func_name),
+                    init=estree_node(
+                        'ArrowFunctionExpression',
+                        id=None,
+                        params=params,
+                        body=body_block,
+                        expression=False,
+                        generator=False,
+                        **{"async":False}
+                    )
+                )
+            ],
+            kind='const'
+        )
+
+        # Add function name to declared variables
+        self._declared_vars.add(func_name)
+
+        return func_declaration
+
+    def visit_Param(self, node):
+        # Convert parameter name to an Identifier node
+        # Parameters in JavaScript functions are represented as simple identifiers
+        return estree_node('Identifier', name=node.name)
+
+    def visit_While(self, node):
+        # Convert the test condition
+        test_js = self.visit(node.test)
+
+        # Convert the body statements
+        body_statements = [self.visit(stmt) for stmt in node.body]
+        # Filter out None results if some statements don't produce output
+        body_statements = [stmt for stmt in body_statements if stmt]
+
+        # Create a BlockStatement for the body
+        body_block = estree_node('BlockStatement', body=body_statements)
+
+        # Create and return the WhileStatement
+        # Using a dictionary with type field instead of named parameters
+        return {
+            'type': 'WhileStatement',
+            'test': test_js,
+            'body': body_block
+        }
+
+    def visit_ForTo(self, node):
+        # Get the loop variable name and create an identifier
+        var_name = node.target.id
+        var_id = self.visit(node.target)
+
+        # Convert start and end expressions
+        start_js = self.visit(node.start)
+        end_js = self.visit(node.end)
+
+        # Create initialization: let i = start
+        init = estree_node('VariableDeclaration',
+                          declarations=[
+                              estree_node('VariableDeclarator',
+                                         id=var_id,
+                                         init=start_js)
+                          ],
+                          kind='let')
+
+        # Add variable to declared variables
+        self._declared_vars.add(var_name)
+
+        # Create test condition: i <= end
+        test = estree_node('BinaryExpression',
+                          operator='<=',
+                          left=var_id,
+                          right=end_js)
+
+        # Create update expression: i++
+        update = estree_node('UpdateExpression',
+                            operator='++',
+                            argument=var_id,
+                            prefix=False)
+
+        # Convert the body statements
+        body_statements = [self.visit(stmt) for stmt in node.body]
+        # Filter out None results if some statements don't produce output
+        body_statements = [stmt for stmt in body_statements if stmt]
+
+        # Create a BlockStatement for the body
+        body_block = estree_node('BlockStatement', body=body_statements)
+
+        # Create and return the ForStatement
+        # Using a dictionary with type field instead of named parameters
+        return {
+            'type': 'ForStatement',
+            'init': init,
+            'test': test,
+            'update': update,
+            'body': body_block
+        }
+
+    def visit_If(self, node):
+        # Convert the test condition
+        test_js = self.visit(node.test)
+
+        # Convert the body statements
+        body_statements = [self.visit(stmt) for stmt in node.body]
+        # Filter out None results if some statements don't produce output
+        body_statements = [stmt for stmt in body_statements if stmt]
+
+        # Create a BlockStatement for the body
+        consequent_block = estree_node('BlockStatement', body=body_statements)
+
+        # Handle the else branch if it exists
+        alternate_block = None
+        if node.orelse:
+            # Check if it's a list (else branch) or another If node (else if branch)
+            if isinstance(node.orelse, list):
+                # Convert the else branch statements
+                else_statements = [self.visit(stmt) for stmt in node.orelse]
+                # Filter out None results if some statements don't produce output
+                else_statements = [stmt for stmt in else_statements if stmt]
+
+                # Create a BlockStatement for the else branch
+                alternate_block = estree_node('BlockStatement', body=else_statements)
+            elif isinstance(node.orelse, If):
+                # It's an else if branch, recursively visit it
+                alternate_block = self.visit(node.orelse)
+            else:
+                # Unexpected type
+                raise ValueError(f"Unexpected type for else branch: {type(node.orelse)}")
+
+        # Create and return the IfStatement
+        # Using a dictionary with type field instead of named parameters
+        return {
+            'type': 'IfStatement',
+            'test': test_js,
+            'consequent': consequent_block,
+            'alternate': alternate_block
+        }
+
+
+""" aka PineStuff/pine_to_pinets.py """
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python pine_to_pinets.py <filename>")
+        print("Usage: python transpilev1.py <filename>")
         sys.exit(1)
     filename = sys.argv[1]
 
@@ -335,7 +541,6 @@ if __name__ == "__main__":
     with open(filename, "r") as f:
         tree = parse(f.read())
     tree_dump = dump(tree, indent=2)
-
     print('Dump completed. Converting AST -> JS...')
 
 
@@ -344,9 +549,9 @@ if __name__ == "__main__":
     js_ast = converter.visit(eval(tree_dump))
 
     # Transpile the JS AST to JavaScript
-    import escodegen 
+    import escodegen
     formatted_code = escodegen.generate(js_ast)
-    
+
     if len(sys.argv) > 2:
         filename = sys.argv[2]
         with open(filename, "w") as f:
